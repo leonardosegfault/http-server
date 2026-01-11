@@ -1,14 +1,17 @@
 CC = gcc
 CFLAGS = -c
 
-all: main.o socket.o server.o  protocol.o
-	$(CC) build/main.o build/socket.o build/server.o build/protocol.o -o build/server
+all: main.o queue.o socket.o server.o  protocol.o
+	$(CC) build/main.o build/queue.o build/socket.o build/server.o build/protocol.o -o build/server
 
 debug: CFLAGS += -g
 debug: all
 
 main.o: src/main.c
 	$(CC) src/main.c $(CFLAGS) -o build/main.o
+
+queue.o: src/queue.c
+	$(CC) src/queue.c $(CFLAGS) -o build/queue.o
 
 server.o: src/server.c
 	$(CC) src/server.c $(CFLAGS) -o build/server.o

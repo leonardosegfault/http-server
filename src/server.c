@@ -9,11 +9,19 @@
 #include <sys/epoll.h>
 #include "socket.h"
 #include "server.h"
+#include "queue.h"
 
 #define RECV_LENGTH (int) 0x40000 // 256 kb
-#define QUEUE_LENGTH 10
+#define QUEUE_LENGTH 100
+
+typedef struct ProcessingClient {
+    int sent;
+    int received;
+    struct epoll_event* event;
+} processing_client_t;
 
 static int queue = -1;
+static linked_list_t client_list = {0};
 static void (*http_request_handler) (int, http_request_t*);
 
 static void handle_server_event(int server_fd, struct epoll_event ev) {
@@ -41,55 +49,32 @@ static void handle_server_event(int server_fd, struct epoll_event ev) {
     }
 }
 
-static void handle_client_event(struct epoll_event ev) {
-    int done = 0;
-    int bytes_available = RECV_LENGTH;
-    char *buffer = malloc(bytes_available);
-    memset(buffer, 0, bytes_available);
+static int handle_client_event(processing_client_t* client) {
+    struct epoll_event ev = *client->event;
 
     int total_recv = 0;
-    while (done == 0) {
-        char temp_buf[RECV_LENGTH];
-        int result = socket_server_recv(ev.data.fd, temp_buf, sizeof(temp_buf),
+    char buffer[RECV_LENGTH] = {0};
+    while (1) {
+        int nbytes = socket_server_recv(ev.data.fd, buffer,
+                                        sizeof(buffer) - total_recv,
                                         MSG_DONTWAIT);
 
-        if (result == 0) {
-            done = 1;
-            break;
-        } else if (result == -1) {
+        if (nbytes == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // TODO: some better non-blocking
-                done = 1;
                 break;
             } else {
-                printf("%d\n", errno);
                 perror("[SERVER] failed to recv data");
-
-                free(buffer);
                 socket_close(ev.data.fd);
-                // TODO: better error handling
+
+                return 1;
             }
         }
-
-        total_recv += result;
-        bytes_available -= result;
-
-        if (bytes_available <= 0) {
-            buffer = realloc(buffer, total_recv + result);
-            if (buffer == NULL) {
-                printf("[SERVER] failed to realloc buffer");
-                exit(1);
-            }
-
-            memset(buffer + total_recv, 0, result);
-            bytes_available += result;
+        
+        total_recv += nbytes;
+        if (total_recv == sizeof(buffer)) {
+            return 1;
         }
-
-        strncat(buffer, temp_buf, bytes_available);
     }
-
-    if (!done)
-        return;
 
     http_request_t request;
     http_response_t response = {0};
@@ -99,19 +84,20 @@ static void handle_client_event(struct epoll_event ev) {
         char response_buffer[256] = {0};
         int response_buffer_len = 0;
 
-        if (parse_err == HTTP_INVALID_METHOD)
-            strcat(message, "<h1>Invalid request</h1><p>The requested method is not valid.</p>");
-        else if (parse_err == HTTP_INVALID_URI)
-            strcat(message, "<h1>Invalid request</h1><p>The requested URI is not valid.</p>");
-        else
-            strcat(message, "<h1>Invalid request</h1><p>The could not be satisfied.</p>");
+        if (parse_err == HTTP_INVALID_METHOD) {
+            strcat(message, "The requested method is not valid");
+        } else if (parse_err == HTTP_INVALID_URI) {
+            strcat(message, "The requested URI is not valid");
+        } else {
+            strcat(message, "Unknown error");
+        }
 
         response.body = message;
         response.body_len = sizeof(message);
         response.status_code = 400;
         response.status_text = "Bad Request";
 
-        http_add_header(&response, "Content-Type", "text/html");
+        http_add_header(&response, "Content-Type", "text/plain");
         http_create_response(response_buffer, response, 0);
 
         response_buffer_len = strlen(response_buffer);
@@ -121,7 +107,7 @@ static void handle_client_event(struct epoll_event ev) {
         (*http_request_handler)(ev.data.fd, &request);
     }
 
-    free(buffer);
+    return 0;
 };
 
 int server_create(int *server, struct sockaddr_in *arg, struct in_addr address,
@@ -172,11 +158,43 @@ void server_start_event_loop(int fd) {
             break;
         }
 
+        struct epoll_event ev;
         for (int i = 0; i < amount; i++) {
-            if (events[i].data.fd == fd)
-                handle_server_event(fd, events[i]);
-            else
-                handle_client_event(events[i]);
+            ev = events[i];
+            if (ev.data.fd == fd) {
+                handle_server_event(fd, ev);
+            } else {
+                processing_client_t* pclient = malloc(sizeof(processing_client_t));
+                pclient->sent = 0;
+                pclient->received = 0;
+
+                struct epoll_event* ev_data = malloc(sizeof(struct epoll_event));
+                *ev_data = ev;
+                pclient->event = ev_data;
+
+                linked_list_item_t* client_data = ll_new_item(pclient);
+                ll_insert(&client_list, client_data);
+            }
+        }
+
+        linked_list_item_t* curr_client = client_list.first;
+        while (curr_client != NULL) {
+            processing_client_t* pclient = curr_client->value;
+            if (pclient == NULL) {
+                curr_client = curr_client->next;
+                ll_remove(&client_list, curr_client);
+                continue;
+            }
+
+            int client_res = handle_client_event(pclient);
+            if (client_res == 0) {
+                linked_list_item_t* next = curr_client->next;
+                // TODO: validate if the client data was fully sent
+                free(pclient->event);
+                free(pclient);
+                ll_remove(&client_list, curr_client);
+                curr_client = next;
+            }
         }
     }
 }
@@ -186,14 +204,15 @@ void server_bind_on_request(void (*handler) (int, http_request_t*)) {
 }
 
 int server_send_file(int client_fd, FILE *file) {
-    int read = -1;
-    while (read != 0) {
+    int nbytes = -1;
+    while (nbytes != 0) {
         char buffer[1024];
-        read = fread(buffer, sizeof(char), sizeof(buffer), file);
-        if (read == -1)
-            return -1;
+        nbytes = fread(buffer, sizeof(char), sizeof(buffer), file);
+        if (nbytes < 1) {
+            return nbytes;
+        }
 
-        socket_server_send(client_fd, buffer, read);
+        socket_server_send(client_fd, buffer, nbytes);
     }
 
     return 0;

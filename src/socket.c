@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
 #include <netinet/in.h>
@@ -46,9 +47,15 @@ int socket_server_recv(int client_fd, char *buffer, int buffer_len, int flags) {
 int socket_server_send(int client_fd, char *buffer, int buffer_len) {
     int sent = 0;
     while (sent < buffer_len) {
-        int result = send(client_fd, buffer + sent, buffer_len - sent, 0);
+        int result = send(client_fd, buffer + sent, buffer_len - sent,
+                          MSG_NOSIGNAL);
 
         if (result == -1) {
+            if (errno == EINTR) continue;
+            if (errno == EPIPE || errno == ECONNRESET) {
+                return -1;
+            }
+
             perror("[SOCKET] failed to send data");
             return -1;
         }
